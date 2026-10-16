@@ -135,6 +135,8 @@ All commands can be invoked using either `dok` or `dk`:
 | `dok autostart enable`| `dk autostart enable`| Re-enable automatic startup on boot |
 | `dok alias add <name>`| `dk alias add` | Create an additional command alias (e.g. `dok alias add dp`) |
 | `dok alias list` | `dk alias list` | List all active binary paths and symlinks |
+| `dok update` | `dk update` | Update Dokploy Local CLI to the latest version from GitHub |
+| `dok uninstall` | `dk uninstall` | Completely uninstall the CLI and remove shell completions |
 | `dok version` | `dk -v` | Display CLI version and Dokploy image release tag |
 | `dok help` | `dk -h` | Display the interactive help menu |
 
