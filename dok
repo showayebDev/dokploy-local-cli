@@ -173,6 +173,24 @@ start_dokploy() {
   local mode="$1"
   check_docker
 
+  # Check if dokploy service exists in Swarm
+  if ! $DOCKER_BIN service inspect dokploy >/dev/null 2>&1; then
+    echo -e "${YELLOW}Notice:${NC} Core service '${BOLD}dokploy${NC}' is not found in Docker Swarm."
+    echo -e "An image is downloaded, but the Swarm service has not been created yet."
+    echo ""
+    read -r -p "Would you like to initialize/create Dokploy services now? [Y/n]: " setup_choice
+    case "$setup_choice" in
+      [nN][oO]|[nN])
+        echo -e "Aborted. You can run ${CYAN}${BOLD}${CMD_NAME} install-dokploy${NC} when ready."
+        return 1
+        ;;
+      *)
+        install_dokploy
+        return 0
+        ;;
+    esac
+  fi
+
   echo -e "${BOLD}[${CMD_NAME}]${NC} Starting core Dokploy services..."
   $DOCKER_BIN service scale dokploy=1 dokploy-postgres=1
   $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1 || true
@@ -431,12 +449,25 @@ install_dokploy() {
     $DOCKER_BIN swarm init >/dev/null 2>&1 || true
   fi
 
-  # 2. Run official Dokploy installer
+  # 2. Check for root or sudo permissions (Dokploy requires root)
+  local SUDO_CMD=""
+  if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+      echo -e "  ${YELLOW}!${NC} The official Dokploy installer requires root privileges."
+      echo -e "  ${YELLOW}!${NC} Prompting for sudo password..."
+      SUDO_CMD="sudo"
+    else
+      echo -e "${RED}Error:${NC} Dokploy installation requires root permissions. Please run as root or install sudo." >&2
+      exit 1
+    fi
+  fi
+
+  # 3. Run official Dokploy installer
   echo -e "  ${CYAN}->${NC} Fetching and executing official Dokploy installer..."
   if command -v curl >/dev/null 2>&1; then
-    curl -sSL https://dokploy.com/install.sh | sh
+    curl -sSL https://dokploy.com/install.sh | $SUDO_CMD bash
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- https://dokploy.com/install.sh | sh
+    wget -qO- https://dokploy.com/install.sh | $SUDO_CMD bash
   else
     echo -e "${RED}Error:${NC} Neither 'curl' nor 'wget' was found. Please install one first." >&2
     exit 1
