@@ -197,7 +197,11 @@ start_dokploy() {
 
   echo -e "${BOLD}[${CMD_NAME}]${NC} Starting core Dokploy services..."
   $DOCKER_BIN service scale dokploy=1 dokploy-postgres=1
-  $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1 || true
+  if ! $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1; then
+    $DOCKER_BIN network disconnect -f dokploy-network dokploy-traefik >/dev/null 2>&1 || true
+    $DOCKER_BIN network connect dokploy-network dokploy-traefik >/dev/null 2>&1 || true
+    $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1 || true
+  fi
 
   if [ "$mode" != "--core" ] && [ "$mode" != "-c" ]; then
     if [ -f "$SVC_STATE" ] && [ -s "$SVC_STATE" ]; then
