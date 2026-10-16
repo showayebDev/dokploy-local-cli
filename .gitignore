@@ -1,0 +1,13 @@
+# OS generated
+.DS_Store
+Thumbs.db
+
+# Cache & state
+.cache/
+*.log
+
+# Editor directories
+.idea/
+.vscode/
+*.swp
+*~
