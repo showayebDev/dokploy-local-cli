@@ -38,8 +38,10 @@ if ($DoUninstall) {
     return
 }
 
-Write-Host "`n=== Dokploy Local CLI Windows Installer ===" -ForegroundColor Cyan
-Write-Host "Target command name: $CliName`n"
+Write-Host ""
+Write-Host "=== Dokploy Local CLI Windows Installer ===" -ForegroundColor Cyan
+Write-Host "Target command name: $CliName"
+Write-Host ""
 
 # Check for Git Bash (bash.exe)
 $GitBashPath = "$env:ProgramFiles\Git\bin\bash.exe"
@@ -109,16 +111,17 @@ Write-Info "Generating PowerShell and CMD batch wrappers..."
 $AllTargets = @($Aliases + $CliName) | Select-Object -Unique
 foreach ($cmdName in $AllTargets) {
     $cmdFile = Join-Path $InstallDir "$cmdName.cmd"
-    $cmdContent = @"
-@echo off
-setlocal
-set "SCRIPT_DIR=%~dp0"
-if exist "%ProgramFiles%\Git\bin\bash.exe" (
-    "%ProgramFiles%\Git\bin\bash.exe" "%SCRIPT_DIR%$cmdName" %* & goto :eof
-)
-bash "%SCRIPT_DIR%$cmdName" %* & goto :eof
-"@
-    Set-Content -Path $cmdFile -Value $cmdContent -Encoding ASCII
+    $cmdLines = @(
+        '@echo off',
+        'setlocal',
+        'set "SCRIPT_DIR=%~dp0"',
+        'if exist "%ProgramFiles%\Git\bin\bash.exe" (',
+        ("    `"%ProgramFiles%\Git\bin\bash.exe`" `"`%SCRIPT_DIR`%{0}`" `%* & goto :eof" -f $cmdName),
+        ')',
+        ("bash `"`%SCRIPT_DIR`%{0}`" `%* & goto :eof" -f $cmdName)
+    )
+    $cmdContent = $cmdLines -join [Environment]::NewLine
+    [System.IO.File]::WriteAllText($cmdFile, $cmdContent, [System.Text.Encoding]::ASCII)
     Write-Info "Wrapper created: $cmdFile"
 }
 
@@ -139,25 +142,30 @@ if (-not (Test-Path $ConfigDir)) {
     New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
 }
 if (-not (Test-Path $ConfigFile)) {
-    $ConfigContent = @"
-CLI_NAME="$CliName"
-CONTAINER_ENGINE="auto"
-DOKPLOY_PORT=3000
-DOKPLOY_NETWORK="dokploy-network"
-STATE_DIR="`$HOME/.cache/dokploy"
-"@
-    Set-Content -Path $ConfigFile -Value $ConfigContent -Encoding ASCII
+    $configLines = @(
+        ("CLI_NAME=`"{0}`"" -f $CliName),
+        'CONTAINER_ENGINE="auto"',
+        'DOKPLOY_PORT=3000',
+        'DOKPLOY_NETWORK="dokploy-network"',
+        'STATE_DIR="$HOME/.cache/dokploy"'
+    )
+    $ConfigContent = $configLines -join [Environment]::NewLine
+    [System.IO.File]::WriteAllText($ConfigFile, $ConfigContent, [System.Text.Encoding]::ASCII)
     Write-Info "Configuration saved: $ConfigFile"
 }
 
-Write-Host "`n✔ Installation successful on Windows!" -ForegroundColor Green
-Write-Host "You can now run commands directly in any PowerShell or CMD terminal:`n"
+Write-Host ""
+Write-Host "✔ Installation successful on Windows!" -ForegroundColor Green
+Write-Host "You can now run commands directly in any PowerShell or CMD terminal:"
+Write-Host ""
 Write-Host "  dok start         # Start Dokploy core + Traefik" -ForegroundColor Cyan
 Write-Host "  dok status        # Check status & web dashboard URL" -ForegroundColor Cyan
 Write-Host "  dok open          # Open dashboard in browser" -ForegroundColor Cyan
 Write-Host "  dok stop          # Stop Dokploy to free CPU & RAM" -ForegroundColor Cyan
-Write-Host "  dok reset -f      # Completely reset database & containers`n" -ForegroundColor Cyan
-Write-Host "Both 'dok' and 'dk' are available out of the box!`n" -ForegroundColor Green
+Write-Host "  dok reset -f      # Completely reset database & containers" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Both 'dok' and 'dk' are available out of the box!" -ForegroundColor Green
+Write-Host ""
 
 if ($args -contains "--install-dokploy" -or $env:INSTALL_DOKPLOY -eq "1") {
     & "$InstallDir\dok.cmd" install-dokploy
