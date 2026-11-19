@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Dokploy Local CLI Manager
-# A fast, portable CLI tool to manage Dokploy local development on any Linux system.
-# Works across all Linux distributions (Ubuntu, Debian, Fedora, Arch, Alpine, etc.)
+# A fast, portable CLI tool to manage Dokploy local development.
+# Works across all platforms: Linux, macOS, and Windows.
+# Supports Docker, Podman, and Kiri container runtimes.
 # ==============================================================================
-#
+# Prevent Git Bash / MSYS on Windows from auto-converting Unix paths
+export MSYS_NO_PATHCONV=1
+
 # CONFIGURATION VARIABLE: Choose Command Word / Prefix
 # Change DEFAULT_CLI_NAME to choose what word starts your commands:
 # Examples: "dok" (dok start), "dk" (dk start), "dokploy" (dokploy start)
@@ -18,9 +21,99 @@ DEFAULT_CLI_NAME="dok"
 
 set -e
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 GITHUB_REPO="${GITHUB_REPO:-showayebDev/dokploy-local-cli}"
 GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
+
+# ------------------------------------------------------------------------------
+# OS Platform Detection (Linux, macOS, Windows)
+# ------------------------------------------------------------------------------
+OS_TYPE=""
+OS_NAME=""
+detect_os() {
+  if [ -n "$OS_TYPE" ]; then
+    return 0
+  fi
+  case "$(uname -s 2>/dev/null || echo "")" in
+    Darwin*)
+      OS_TYPE="macos"
+      OS_NAME="macOS"
+      ;;
+    Linux*)
+      if grep -qi "microsoft" /proc/version 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
+        OS_TYPE="wsl"
+        OS_NAME="Linux (WSL)"
+      else
+        OS_TYPE="linux"
+        OS_NAME="Linux"
+      fi
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      OS_TYPE="windows"
+      OS_NAME="Windows"
+      ;;
+    *)
+      if command -v cmd.exe >/dev/null 2>&1 || command -v powershell.exe >/dev/null 2>&1; then
+        OS_TYPE="windows"
+        OS_NAME="Windows"
+      else
+        OS_TYPE="unix"
+        OS_NAME="$(uname -s 2>/dev/null || echo 'Unix')"
+      fi
+      ;;
+  esac
+}
+detect_os
+
+# ------------------------------------------------------------------------------
+# Cross-Platform Helpers (macOS BSD vs Linux GNU compatibility)
+# ------------------------------------------------------------------------------
+# Cross-platform in-place sed (compatible with macOS BSD sed and Linux GNU sed)
+sed_inplace() {
+  local expr="$1"
+  local file="$2"
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  sed -i.dokbak "$expr" "$file" 2>/dev/null && rm -f "${file}.dokbak" 2>/dev/null || true
+}
+
+# Cross-platform secret generator (supports macOS, Linux, and Windows Git Bash)
+generate_random_secret() {
+  local length="${1:-32}"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex "$((length / 2))" 2>/dev/null
+  elif [ -r /dev/urandom ]; then
+    LC_ALL=C tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$length"
+  else
+    local seed="$RANDOM$(date +%s)$$${HOSTNAME:-}"
+    if command -v sha256sum >/dev/null 2>&1; then
+      echo "$seed" | sha256sum | awk '{print $1}' | head -c "$length"
+    elif command -v shasum >/dev/null 2>&1; then
+      echo "$seed" | shasum -a 256 | awk '{print $1}' | head -c "$length"
+    else
+      echo "dokploy_secret_${RANDOM}_$(date +%s)" | head -c "$length"
+    fi
+  fi
+}
+
+# Cross-platform binary path resolver (replaces readlink -f for macOS compatibility)
+resolve_script_path() {
+  local target="$1"
+  local resolved
+  resolved="$(readlink -f "$target" 2>/dev/null || realpath "$target" 2>/dev/null || echo "")"
+  if [ -n "$resolved" ] && [ -f "$resolved" ]; then
+    echo "$resolved"
+    return 0
+  fi
+  while [ -L "$target" ]; do
+    local dir
+    dir="$(cd -P "$(dirname "$target")" && pwd)"
+    target="$(readlink "$target")"
+    [[ $target != /* ]] && target="$dir/$target"
+  done
+  echo "$(cd -P "$(dirname "$target")" && pwd)/$(basename "$target")"
+}
 
 # User configuration paths
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/dokploy-cli"
@@ -78,31 +171,181 @@ fi
 # ------------------------------------------------------------------------------
 # Helper Functions
 # ------------------------------------------------------------------------------
+# Container Engine Abstraction (Docker, Podman, Kiri)
+# ------------------------------------------------------------------------------
 ensure_state_dir() {
   mkdir -p "$STATE_DIR"
 }
 
+CONTAINER_ENGINE="${CONTAINER_ENGINE:-${DOK_ENGINE:-auto}}"
+ENGINE_BIN=""
+ENGINE_TYPE=""
+ENGINE_NAME=""
+ENGINE_SOCK="/var/run/docker.sock"
 DOCKER_BIN=""
-check_docker() {
-  if command -v docker >/dev/null 2>&1; then
-    DOCKER_BIN="docker"
-  else
-    echo -e "${RED}Error:${NC} 'docker' is not installed or not in your PATH." >&2
-    echo "Please install Docker first: https://docs.docker.com/engine/install/" >&2
-    exit 1
+
+test_engine_bin() {
+  local b="$1"
+  if command -v "$b" >/dev/null 2>&1; then
+    if "$b" info >/dev/null 2>&1; then
+      return 0
+    fi
+    if command -v sudo >/dev/null 2>&1 && sudo -n "$b" info >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+detect_engine() {
+  # Avoid re-detecting if already resolved in this session
+  if [ -n "$ENGINE_BIN" ]; then
+    return 0
   fi
 
-  if ! $DOCKER_BIN info >/dev/null 2>&1; then
-    if command -v sudo >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
-      DOCKER_BIN="sudo docker"
+  local preferred="$CONTAINER_ENGINE"
+  if [ "$preferred" = "auto" ] && [ -n "${DOKPLOY_ENGINE:-}" ]; then
+    preferred="$DOKPLOY_ENGINE"
+  fi
+
+  # Explicit override requested
+  if [ -n "$preferred" ] && [ "$preferred" != "auto" ]; then
+    case "$preferred" in
+      podman)
+        if test_engine_bin podman; then
+          ENGINE_BIN="podman"
+          ENGINE_TYPE="podman"
+          ENGINE_NAME="Podman"
+        else
+          echo -e "${RED}Error:${NC} Configured engine 'podman' is not available or daemon is not running." >&2
+          exit 1
+        fi
+        ;;
+      kiri)
+        if test_engine_bin docker && (docker context show 2>/dev/null | grep -qi "kiri" || docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -qi "kiri"); then
+          ENGINE_BIN="docker"
+          ENGINE_TYPE="kiri"
+          ENGINE_NAME="Kiri Container Runtime"
+        elif test_engine_bin kiri; then
+          ENGINE_BIN="kiri"
+          ENGINE_TYPE="kiri"
+          ENGINE_NAME="Kiri"
+        else
+          echo -e "${RED}Error:${NC} Configured engine 'kiri' is not active or running." >&2
+          exit 1
+        fi
+        ;;
+      nerdctl)
+        if test_engine_bin nerdctl; then
+          ENGINE_BIN="nerdctl"
+          ENGINE_TYPE="nerdctl"
+          ENGINE_NAME="Nerdctl (containerd)"
+        else
+          echo -e "${RED}Error:${NC} Configured engine 'nerdctl' is not available or daemon is not running." >&2
+          exit 1
+        fi
+        ;;
+      docker)
+        if test_engine_bin docker; then
+          ENGINE_BIN="docker"
+          if docker info --format '{{.OperatingSystem}}' 2>/dev/null | grep -qi "kiri" || docker context show 2>/dev/null | grep -qi "kiri"; then
+            ENGINE_TYPE="kiri"
+            ENGINE_NAME="Kiri (via docker context)"
+          elif [ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" = "active" ]; then
+            ENGINE_TYPE="docker"
+            ENGINE_NAME="Docker (Swarm Mode)"
+          else
+            ENGINE_TYPE="docker"
+            ENGINE_NAME="Docker (Standalone Mode)"
+          fi
+        else
+          echo -e "${RED}Error:${NC} Configured engine 'docker' is not available or daemon is not running." >&2
+          exit 1
+        fi
+        ;;
+      *)
+        if test_engine_bin "$preferred"; then
+          ENGINE_BIN="$preferred"
+          ENGINE_TYPE="$preferred"
+          ENGINE_NAME="$preferred"
+        fi
+        ;;
+    esac
+  fi
+
+  # Auto-detect engine if not yet determined
+  if [ -z "$ENGINE_BIN" ]; then
+    if test_engine_bin docker; then
+      ENGINE_BIN="docker"
+      local os_info ctx_info
+      os_info=$(docker info --format '{{.OperatingSystem}}' 2>/dev/null || echo "")
+      ctx_info=$(docker context show 2>/dev/null || echo "")
+      if echo "$os_info $ctx_info" | grep -qi "kiri"; then
+        ENGINE_TYPE="kiri"
+        ENGINE_NAME="Kiri Container Runtime"
+      elif [ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" = "active" ]; then
+        ENGINE_TYPE="docker"
+        ENGINE_NAME="Docker (Swarm Mode)"
+      else
+        ENGINE_TYPE="docker"
+        ENGINE_NAME="Docker (Standalone Mode)"
+      fi
+    elif test_engine_bin podman; then
+      ENGINE_BIN="podman"
+      ENGINE_TYPE="podman"
+      ENGINE_NAME="Podman"
+    elif test_engine_bin kiri; then
+      ENGINE_BIN="kiri"
+      ENGINE_TYPE="kiri"
+      ENGINE_NAME="Kiri"
+    elif test_engine_bin nerdctl; then
+      ENGINE_BIN="nerdctl"
+      ENGINE_TYPE="nerdctl"
+      ENGINE_NAME="Nerdctl (containerd)"
     else
-      echo -e "${RED}Error:${NC} Cannot connect to the Docker daemon." >&2
-      echo -e "Make sure Docker service is active and your user has permissions:" >&2
-      echo -e "  1. Start Docker:  ${CYAN}sudo systemctl start docker${NC} (or ${CYAN}sudo service docker start${NC})" >&2
-      echo -e "  2. User group:    ${CYAN}sudo usermod -aG docker \$USER${NC} (log out & back in)" >&2
+      echo -e "${RED}Error:${NC} No supported container engine found (Docker, Podman, Kiri, or Nerdctl)." >&2
+      echo -e "Please ensure Docker, Podman, Kiri, or Nerdctl is installed and active in your PATH." >&2
       exit 1
     fi
   fi
+
+  # Check root/sudo permissions for engine binary if required
+  if ! $ENGINE_BIN info >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1 && sudo -n $ENGINE_BIN info >/dev/null 2>&1; then
+      ENGINE_BIN="sudo $ENGINE_BIN"
+    fi
+  fi
+
+  # Resolve socket path for Dokploy container bind mount across Linux, macOS, and Windows
+  if [ "$ENGINE_TYPE" = "podman" ]; then
+    if [ -S "/run/podman/podman.sock" ]; then
+      ENGINE_SOCK="/run/podman/podman.sock"
+    elif [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -S "$XDG_RUNTIME_DIR/podman/podman.sock" ]; then
+      ENGINE_SOCK="$XDG_RUNTIME_DIR/podman/podman.sock"
+    elif [ -S "/run/user/$(id -u 2>/dev/null || echo 1000)/podman/podman.sock" ]; then
+      ENGINE_SOCK="/run/user/$(id -u 2>/dev/null || echo 1000)/podman/podman.sock"
+    elif [ -S "$HOME/.local/share/containers/podman/machine/podman.sock" ]; then
+      ENGINE_SOCK="$HOME/.local/share/containers/podman/machine/podman.sock"
+    else
+      ENGINE_SOCK="/var/run/docker.sock"
+    fi
+  else
+    if [ -S "/var/run/docker.sock" ]; then
+      ENGINE_SOCK="/var/run/docker.sock"
+    elif [ -S "$HOME/.docker/run/docker.sock" ]; then
+      ENGINE_SOCK="$HOME/.docker/run/docker.sock"
+    elif [ -S "$HOME/.colima/default/docker.sock" ]; then
+      ENGINE_SOCK="$HOME/.colima/default/docker.sock"
+    else
+      ENGINE_SOCK="/var/run/docker.sock"
+    fi
+  fi
+
+  DOCKER_BIN="$ENGINE_BIN"
+}
+
+check_docker() {
+  detect_engine
 }
 
 get_dokploy_net_id() {
@@ -137,7 +380,9 @@ ${BOLD}Primary Commands:${NC}
   ${MAGENTA}logs${NC}, ${MAGENTA}log${NC} [target]     Inspect container or service logs (panel, db, traefik)
   ${BOLD}open${NC}, ${BOLD}ui${NC}               Open the Dokploy dashboard in your default browser
   ${RED}clean${NC}, ${RED}prune${NC}           Prune stopped containers and build artifacts
+  ${RED}reset${NC}                  Completely wipe Dokploy data, database, and containers
   ${CYAN}alias${NC}                Manage or add CLI command aliases (e.g. dok, dk)
+  ${CYAN}engine${NC} [action]       Inspect or switch container engine (docker, podman, kiri)
   ${GREEN}install-dokploy${NC}      Install Dokploy and automatically disable boot auto-startup
   ${YELLOW}disable-autostart${NC}    Disable Dokploy & Traefik auto-startup on boot
   ${CYAN}autostart${NC} [action]    Manage boot auto-startup (status, disable, enable)
@@ -162,6 +407,11 @@ ${BOLD}Examples:${NC}
   ${CYAN}${CMD_NAME} status${NC}              Inspect running services, replicas, and ports
   ${CYAN}${CMD_NAME} logs panel -f${NC}       Follow Dokploy web panel logs
   ${CYAN}${CMD_NAME} open${NC}                Open Dokploy dashboard (http://localhost:${DOKPLOY_PORT})
+  ${CYAN}${CMD_NAME} reset${NC}               Completely reset Dokploy database & containers
+  ${CYAN}${CMD_NAME} reset -f${NC}            Force reset Dokploy without confirmation prompt
+  ${CYAN}${CMD_NAME} engine status${NC}       Display active container engine and socket details
+  ${CYAN}${CMD_NAME} engine set kiri${NC}     Switch default engine to Kiri
+  ${CYAN}${CMD_NAME} engine set podman${NC}   Switch default engine to Podman
   ${CYAN}${CMD_NAME} install-dokploy${NC}     Install Dokploy locally with auto-boot disabled
   ${CYAN}${CMD_NAME} disable-autostart${NC}   Remove boot auto-startup from Dokploy & Traefik
   ${CYAN}${CMD_NAME} autostart status${NC}     Check whether Dokploy auto-starts on boot
@@ -173,34 +423,131 @@ EOF
 # ------------------------------------------------------------------------------
 # Core Actions: start, stop, restart, status
 # ------------------------------------------------------------------------------
+is_swarm_available() {
+  [ "$ENGINE_TYPE" = "docker" ] || return 1
+  local swarm_state
+  swarm_state=$($DOCKER_BIN info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo "inactive")
+  [ "$swarm_state" = "active" ]
+}
+
+install_dokploy_standalone() {
+  echo -e "${BOLD}[${CMD_NAME}]${NC} Initializing Dokploy for local development on ${ENGINE_NAME}..."
+
+  local sec_opts=()
+  if [ "$ENGINE_TYPE" = "podman" ]; then
+    sec_opts=(--security-opt label=disable)
+  fi
+
+  # Create bridge network
+  $DOCKER_BIN network create "$DOKPLOY_NETWORK" 2>/dev/null || true
+
+  # Start postgres
+  if ! $DOCKER_BIN inspect dokploy-postgres >/dev/null 2>&1; then
+    echo -e "  ${CYAN}->${NC} Creating dokploy-postgres database container..."
+    $DOCKER_BIN run -d \
+      --name dokploy-postgres \
+      --network "$DOKPLOY_NETWORK" \
+      --restart unless-stopped \
+      "${sec_opts[@]}" \
+      -e POSTGRES_USER=dokploy \
+      -e POSTGRES_DB=dokploy \
+      -e POSTGRES_PASSWORD=dokploypassword \
+      -v dokploy-postgres-data:/var/lib/postgresql/data \
+      postgres:16 || true
+  else
+    $DOCKER_BIN start dokploy-postgres >/dev/null 2>&1 || true
+  fi
+
+  # Start dokploy
+  if ! $DOCKER_BIN inspect dokploy >/dev/null 2>&1; then
+    echo -e "  ${CYAN}->${NC} Creating dokploy web dashboard container..."
+    $DOCKER_BIN run -d \
+      --name dokploy \
+      --network "$DOKPLOY_NETWORK" \
+      --restart unless-stopped \
+      "${sec_opts[@]}" \
+      -p "${DOKPLOY_PORT}:3000" \
+      -v "${ENGINE_SOCK}:/var/run/docker.sock" \
+      -v dokploy-data:/etc/dokploy \
+      -e DATABASE_URL="postgres://dokploy:dokploypassword@dokploy-postgres:5432/dokploy" \
+      -e BETTER_AUTH_SECRET="a8f9c73e1b6408259dfc97284b8109d732890471b69482035816901842857189" \
+      dokploy/dokploy:latest || true
+  else
+    $DOCKER_BIN start dokploy >/dev/null 2>&1 || true
+  fi
+
+  # Start traefik
+  if ! $DOCKER_BIN inspect dokploy-traefik >/dev/null 2>&1; then
+    echo -e "  ${CYAN}->${NC} Creating dokploy-traefik proxy container..."
+    $DOCKER_BIN run -d \
+      --name dokploy-traefik \
+      --network "$DOKPLOY_NETWORK" \
+      --restart unless-stopped \
+      "${sec_opts[@]}" \
+      -p 80:80 \
+      -p 443:443 \
+      -v "${ENGINE_SOCK}:/var/run/docker.sock:ro" \
+      traefik:v3.1 || true
+  else
+    $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1 || true
+  fi
+
+  echo -e "\n${GREEN}✔ Dokploy successfully initialized on ${ENGINE_NAME}!${NC}"
+  echo -e "  Dashboard: ${CYAN}${BOLD}http://localhost:${DOKPLOY_PORT}${NC}"
+}
+
 start_dokploy() {
   local mode="$1"
   check_docker
 
-  # Check if dokploy service exists in Swarm
-  if ! $DOCKER_BIN service inspect dokploy >/dev/null 2>&1; then
-    echo -e "${YELLOW}Notice:${NC} Core service '${BOLD}dokploy${NC}' is not found in Docker Swarm."
-    echo -e "An image is downloaded, but the Swarm service has not been created yet."
-    echo ""
-    read -r -p "Would you like to initialize/create Dokploy services now? [Y/n]: " setup_choice
-    case "$setup_choice" in
-      [nN][oO]|[nN])
-        echo -e "Aborted. You can run ${CYAN}${BOLD}${CMD_NAME} install-dokploy${NC} when ready."
-        return 1
-        ;;
-      *)
-        install_dokploy
-        return 0
-        ;;
-    esac
-  fi
+  if is_swarm_available; then
+    # Swarm mode
+    if ! $DOCKER_BIN service inspect dokploy >/dev/null 2>&1; then
+      echo -e "${YELLOW}Notice:${NC} Core service '${BOLD}dokploy${NC}' is not found in Docker Swarm."
+      echo -e "An image is downloaded, but the Swarm service has not been created yet."
+      echo ""
+      read -r -p "Would you like to initialize/create Dokploy services now? [Y/n]: " setup_choice
+      case "$setup_choice" in
+        [nN][oO]|[nN])
+          echo -e "Aborted. You can run ${CYAN}${BOLD}${CMD_NAME} install-dokploy${NC} when ready."
+          return 1
+          ;;
+        *)
+          install_dokploy
+          return 0
+          ;;
+      esac
+    fi
 
-  echo -e "${BOLD}[${CMD_NAME}]${NC} Starting core Dokploy services..."
-  $DOCKER_BIN service scale dokploy=1 dokploy-postgres=1
-  if ! $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1; then
-    $DOCKER_BIN network disconnect -f dokploy-network dokploy-traefik >/dev/null 2>&1 || true
-    $DOCKER_BIN network connect dokploy-network dokploy-traefik >/dev/null 2>&1 || true
-    $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1 || true
+    echo -e "${BOLD}[${CMD_NAME}]${NC} Starting core Dokploy services (Swarm)..."
+    $DOCKER_BIN service scale dokploy=1 dokploy-postgres=1
+    if ! $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1; then
+      $DOCKER_BIN network disconnect -f dokploy-network dokploy-traefik >/dev/null 2>&1 || true
+      $DOCKER_BIN network connect dokploy-network dokploy-traefik >/dev/null 2>&1 || true
+      $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1 || true
+    fi
+  else
+    # Standalone Container Mode (Kiri / Podman / Docker Standalone)
+    if ! $DOCKER_BIN inspect dokploy >/dev/null 2>&1; then
+      echo -e "${YELLOW}Notice:${NC} Dokploy container is not yet initialized on ${ENGINE_NAME}."
+      read -r -p "Would you like to initialize Dokploy now? [Y/n]: " setup_choice
+      case "$setup_choice" in
+        [nN][oO]|[nN])
+          echo -e "Aborted. You can run ${CYAN}${BOLD}${CMD_NAME} install-dokploy${NC} when ready."
+          return 1
+          ;;
+        *)
+          install_dokploy_standalone
+          return 0
+          ;;
+      esac
+    fi
+
+    echo -e "${BOLD}[${CMD_NAME}]${NC} Starting Dokploy core containers (${ENGINE_NAME})..."
+    $DOCKER_BIN start dokploy-postgres dokploy >/dev/null 2>&1 || true
+    if [ "$mode" != "--core" ] && [ "$mode" != "-c" ]; then
+      $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1 || true
+    fi
   fi
 
   if [ "$mode" != "--core" ] && [ "$mode" != "-c" ]; then
@@ -238,68 +585,99 @@ stop_dokploy() {
   local mode="$1"
   check_docker
 
-  # If --core, only stop dokploy and dokploy-postgres
-  if [ "$mode" = "--core" ] || [ "$mode" = "-c" ]; then
-    echo -e "${BOLD}[${CMD_NAME}]${NC} Stopping only Dokploy core services..."
-    $DOCKER_BIN service scale dokploy=0 dokploy-postgres=0
-    echo -e "${YELLOW}✔${NC} Dokploy core stopped. User applications and Traefik remain running."
-    return 0
-  fi
+  if is_swarm_available; then
+    # If --core, only stop dokploy and dokploy-postgres
+    if [ "$mode" = "--core" ] || [ "$mode" = "-c" ]; then
+      echo -e "${BOLD}[${CMD_NAME}]${NC} Stopping only Dokploy core services..."
+      $DOCKER_BIN service scale dokploy=0 dokploy-postgres=0
+      echo -e "${YELLOW}✔${NC} Dokploy core stopped. User applications and Traefik remain running."
+      return 0
+    fi
 
-  # Without --core: Stop ALL (user apps + dokploy + dokploy-postgres + dokploy-traefik)
-  ensure_state_dir
-  > "$SVC_STATE"
-  > "$CONT_STATE"
+    # Without --core: Stop ALL (user apps + dokploy + dokploy-postgres + dokploy-traefik)
+    ensure_state_dir
+    > "$SVC_STATE"
+    > "$CONT_STATE"
 
-  echo -e "${BOLD}[${CMD_NAME}]${NC} Scanning for active Dokploy user applications..."
-  local net_id
-  net_id=$(get_dokploy_net_id)
+    echo -e "${BOLD}[${CMD_NAME}]${NC} Scanning for active Dokploy user applications..."
+    local net_id
+    net_id=$(get_dokploy_net_id)
 
-  if [ -n "$net_id" ]; then
-    # 1. Detect and scale down Swarm services on dokploy-network (excluding core)
-    for s_id in $($DOCKER_BIN service ls -q 2>/dev/null); do
-      local name
-      name=$($DOCKER_BIN service inspect --format '{{.Spec.Name}}' "$s_id" 2>/dev/null)
-      if [ "$name" = "dokploy" ] || [ "$name" = "dokploy-postgres" ]; then
-        continue
-      fi
-
-      local is_on_net
-      is_on_net=$($DOCKER_BIN service inspect --format '{{range .Spec.TaskTemplate.Networks}}{{.Target}} {{end}}' "$s_id" 2>/dev/null | grep -w "$net_id" || true)
-      if [ -n "$is_on_net" ]; then
-        local replicas
-        replicas=$($DOCKER_BIN service inspect --format '{{if .Spec.Mode.Replicated}}{{.Spec.Mode.Replicated.Replicas}}{{else}}0{{end}}' "$s_id" 2>/dev/null)
-        if [ "$replicas" -gt 0 ]; then
-          echo -e "  ${YELLOW}->${NC} Stopping service: ${BOLD}$name${NC} (was $replicas replicas)"
-          echo "$name=$replicas" >> "$SVC_STATE"
-          $DOCKER_BIN service scale "$name=0" >/dev/null 2>&1 || true
+    if [ -n "$net_id" ]; then
+      for s_id in $($DOCKER_BIN service ls -q 2>/dev/null); do
+        local name
+        name=$($DOCKER_BIN service inspect --format '{{.Spec.Name}}' "$s_id" 2>/dev/null)
+        if [ "$name" = "dokploy" ] || [ "$name" = "dokploy-postgres" ]; then
+          continue
         fi
-      fi
-    done
 
-    # 2. Detect and stop standalone containers on dokploy-network
-    $DOCKER_BIN ps --filter "network=$DOKPLOY_NETWORK" --format '{{.ID}} {{.Names}} {{.Label "com.docker.swarm.service.name"}}' 2>/dev/null | while IFS= read -r line; do
+        local is_on_net
+        is_on_net=$($DOCKER_BIN service inspect --format '{{range .Spec.TaskTemplate.Networks}}{{.Target}} {{end}}' "$s_id" 2>/dev/null | grep -w "$net_id" || true)
+        if [ -n "$is_on_net" ]; then
+          local replicas
+          replicas=$($DOCKER_BIN service inspect --format '{{if .Spec.Mode.Replicated}}{{.Spec.Mode.Replicated.Replicas}}{{else}}0{{end}}' "$s_id" 2>/dev/null)
+          if [ "$replicas" -gt 0 ]; then
+            echo -e "  ${YELLOW}->${NC} Stopping service: ${BOLD}$name${NC} (was $replicas replicas)"
+            echo "$name=$replicas" >> "$SVC_STATE"
+            $DOCKER_BIN service scale "$name=0" >/dev/null 2>&1 || true
+          fi
+        fi
+      done
+
+      $DOCKER_BIN ps --filter "network=$DOKPLOY_NETWORK" --format '{{.ID}} {{.Names}} {{.Label "com.docker.swarm.service.name"}}' 2>/dev/null | while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        local c_id c_name swarm_svc
+        c_id=$(echo "$line" | awk '{print $1}')
+        c_name=$(echo "$line" | awk '{print $2}')
+        swarm_svc=$(echo "$line" | awk '{print $3}')
+
+        if [ "$c_name" = "dokploy-traefik" ] || [ -n "$swarm_svc" ]; then
+          continue
+        fi
+
+        echo -e "  ${YELLOW}->${NC} Stopping standalone container: ${BOLD}$c_name${NC} ($c_id)"
+        echo "$c_id" >> "$CONT_STATE"
+        $DOCKER_BIN stop "$c_id" >/dev/null 2>&1 || true
+      done
+    fi
+
+    echo -e "${BOLD}[${CMD_NAME}]${NC} Stopping core Dokploy services..."
+    $DOCKER_BIN service scale dokploy=0 dokploy-postgres=0
+    $DOCKER_BIN stop dokploy-traefik >/dev/null 2>&1 || true
+
+    echo -e "${GREEN}✔${NC} Dokploy and all associated applications stopped. CPU and RAM freed!"
+  else
+    # Standalone Container Mode (Kiri)
+    if [ "$mode" = "--core" ] || [ "$mode" = "-c" ]; then
+      echo -e "${BOLD}[${CMD_NAME}]${NC} Stopping only Dokploy core panel..."
+      $DOCKER_BIN stop dokploy dokploy-postgres >/dev/null 2>&1 || true
+      echo -e "${YELLOW}✔${NC} Dokploy core stopped. User applications and Traefik remain running."
+      return 0
+    fi
+
+    ensure_state_dir
+    > "$CONT_STATE"
+
+    echo -e "${BOLD}[${CMD_NAME}]${NC} Scanning for active Dokploy user containers..."
+    $DOCKER_BIN ps --filter "network=$DOKPLOY_NETWORK" --format '{{.ID}} {{.Names}}' 2>/dev/null | while IFS= read -r line; do
       [ -z "$line" ] && continue
-      local c_id c_name swarm_svc
+      local c_id c_name
       c_id=$(echo "$line" | awk '{print $1}')
       c_name=$(echo "$line" | awk '{print $2}')
-      swarm_svc=$(echo "$line" | awk '{print $3}')
 
-      if [ "$c_name" = "dokploy-traefik" ] || [ -n "$swarm_svc" ]; then
+      if [ "$c_name" = "dokploy" ] || [ "$c_name" = "dokploy-postgres" ] || [ "$c_name" = "dokploy-traefik" ]; then
         continue
       fi
 
-      echo -e "  ${YELLOW}->${NC} Stopping standalone container: ${BOLD}$c_name${NC} ($c_id)"
+      echo -e "  ${YELLOW}->${NC} Stopping container: ${BOLD}$c_name${NC} ($c_id)"
       echo "$c_id" >> "$CONT_STATE"
       $DOCKER_BIN stop "$c_id" >/dev/null 2>&1 || true
     done
+
+    echo -e "${BOLD}[${CMD_NAME}]${NC} Stopping Dokploy core containers..."
+    $DOCKER_BIN stop dokploy dokploy-postgres dokploy-traefik >/dev/null 2>&1 || true
+    echo -e "${GREEN}✔${NC} Dokploy and all associated applications stopped. CPU and RAM freed!"
   fi
-
-  echo -e "${BOLD}[${CMD_NAME}]${NC} Stopping core Dokploy services..."
-  $DOCKER_BIN service scale dokploy=0 dokploy-postgres=0
-  $DOCKER_BIN stop dokploy-traefik >/dev/null 2>&1 || true
-
-  echo -e "${GREEN}✔${NC} Dokploy and all associated applications stopped. CPU and RAM freed!"
 }
 
 status_dokploy() {
@@ -308,33 +686,61 @@ status_dokploy() {
   echo -e "${BOLD}======================================================${NC}"
   echo -e "${BOLD} Dokploy Local Development Status  (${CYAN}${CMD_NAME}${NC}${BOLD})${NC}"
   echo -e "${BOLD}======================================================${NC}"
+  echo -e "Platform:           ${GREEN}${OS_NAME}${NC}"
+  echo -e "Container Engine:   ${GREEN}${ENGINE_NAME}${NC}"
 
-  # Core Dokploy Swarm Services
-  echo -e "\n${BOLD}${CYAN}Core Dokploy Services:${NC}"
-  $DOCKER_BIN service ls --filter "name=dokploy" --format "table {{.Name}}\t{{.Mode}}\t{{.Replicas}}\t{{.Image}}"
+  if is_swarm_available; then
+    # Core Dokploy Swarm Services
+    echo -e "\n${BOLD}${CYAN}Core Dokploy Services (Swarm):${NC}"
+    $DOCKER_BIN service ls --filter "name=dokploy" --format "table {{.Name}}\t{{.Mode}}\t{{.Replicas}}\t{{.Image}}"
 
-  # Dokploy Traefik
-  echo -e "\n${BOLD}${CYAN}Dokploy Traefik Proxy:${NC}"
-  $DOCKER_BIN ps -a --filter "name=dokploy-traefik" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    # Dokploy Traefik
+    echo -e "\n${BOLD}${CYAN}Dokploy Traefik Proxy:${NC}"
+    $DOCKER_BIN ps -a --filter "name=dokploy-traefik" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
-  # User Applications
-  echo -e "\n${BOLD}${CYAN}Dokploy User Applications & Services:${NC}"
-  local user_apps
-  user_apps=$($DOCKER_BIN service ls --format "table {{.Name}}\t{{.Mode}}\t{{.Replicas}}\t{{.Image}}" 2>/dev/null | grep -v -E "^(dokploy|dokploy-postgres)[[:space:]]" || true)
-  if [ -n "$user_apps" ]; then
-    echo "$user_apps"
+    # User Applications
+    echo -e "\n${BOLD}${CYAN}Dokploy User Applications & Services:${NC}"
+    local user_apps
+    user_apps=$($DOCKER_BIN service ls --format "table {{.Name}}\t{{.Mode}}\t{{.Replicas}}\t{{.Image}}" 2>/dev/null | grep -v -E "^(dokploy|dokploy-postgres)[[:space:]]" || true)
+    if [ -n "$user_apps" ]; then
+      echo "$user_apps"
+    else
+      echo -e "${DIM}No user applications currently deployed.${NC}"
+    fi
+
+    # Check if core panel is running
+    local panel_replicas
+    panel_replicas=$($DOCKER_BIN service inspect dokploy --format '{{if .Spec.Mode.Replicated}}{{.Spec.Mode.Replicated.Replicas}}{{else}}0{{end}}' 2>/dev/null || echo "0")
+    echo ""
+    if [ "$panel_replicas" -gt 0 ]; then
+      echo -e "${GREEN}●${NC} Dokploy Web Dashboard: ${CYAN}${BOLD}http://localhost:${DOKPLOY_PORT}${NC}"
+    else
+      echo -e "${YELLOW}○${NC} Dokploy is currently stopped. Run ${BOLD}'${CMD_NAME} start'${NC} to start."
+    fi
   else
-    echo -e "${DIM}No user applications currently deployed.${NC}"
-  fi
+    # Standalone Container Mode (Kiri / Podman / Docker Standalone)
+    echo -e "\n${BOLD}${CYAN}Engine Mode:${NC} ${GREEN}${ENGINE_NAME} (Standalone Mode)${NC}"
 
-  # Check if core panel is running
-  local panel_replicas
-  panel_replicas=$($DOCKER_BIN service inspect dokploy --format '{{if .Spec.Mode.Replicated}}{{.Spec.Mode.Replicated.Replicas}}{{else}}0{{end}}' 2>/dev/null || echo "0")
-  echo ""
-  if [ "$panel_replicas" -gt 0 ]; then
-    echo -e "${GREEN}●${NC} Dokploy Web Dashboard: ${CYAN}${BOLD}http://localhost:${DOKPLOY_PORT}${NC}"
-  else
-    echo -e "${YELLOW}○${NC} Dokploy is currently stopped. Run ${BOLD}'${CMD_NAME} start'${NC} to start."
+    echo -e "\n${BOLD}${CYAN}Core Dokploy Containers:${NC}"
+    $DOCKER_BIN ps -a --filter "name=dokploy" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+    echo -e "\n${BOLD}${CYAN}Dokploy User Applications:${NC}"
+    local user_apps
+    user_apps=$($DOCKER_BIN ps -a --filter "network=$DOKPLOY_NETWORK" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null | grep -v -E "^(dokploy|dokploy-postgres|dokploy-traefik)[[:space:]]" || true)
+    if [ -n "$user_apps" ]; then
+      echo "$user_apps"
+    else
+      echo -e "${DIM}No user applications currently deployed on $DOKPLOY_NETWORK.${NC}"
+    fi
+
+    local is_running
+    is_running=$($DOCKER_BIN inspect --format '{{.State.Running}}' dokploy 2>/dev/null || echo "false")
+    echo ""
+    if [ "$is_running" = "true" ]; then
+      echo -e "${GREEN}●${NC} Dokploy Web Dashboard: ${CYAN}${BOLD}http://localhost:${DOKPLOY_PORT}${NC}"
+    else
+      echo -e "${YELLOW}○${NC} Dokploy is currently stopped. Run ${BOLD}'${CMD_NAME} start'${NC} to start."
+    fi
   fi
 }
 
@@ -355,11 +761,19 @@ logs_dokploy() {
   case "$target" in
     panel|web|core)
       echo -e "${BOLD}[${CMD_NAME}]${NC} Logs for ${BOLD}dokploy${NC} web panel:"
-      $DOCKER_BIN service logs "${extra_args[@]}" dokploy
+      if is_swarm_available && $DOCKER_BIN service inspect dokploy >/dev/null 2>&1; then
+        $DOCKER_BIN service logs "${extra_args[@]}" dokploy
+      else
+        $DOCKER_BIN logs "${extra_args[@]}" dokploy
+      fi
       ;;
     db|postgres)
       echo -e "${BOLD}[${CMD_NAME}]${NC} Logs for ${BOLD}dokploy-postgres${NC} database:"
-      $DOCKER_BIN service logs "${extra_args[@]}" dokploy-postgres
+      if is_swarm_available && $DOCKER_BIN service inspect dokploy-postgres >/dev/null 2>&1; then
+        $DOCKER_BIN service logs "${extra_args[@]}" dokploy-postgres
+      else
+        $DOCKER_BIN logs "${extra_args[@]}" dokploy-postgres
+      fi
       ;;
     traefik|proxy)
       echo -e "${BOLD}[${CMD_NAME}]${NC} Logs for ${BOLD}dokploy-traefik${NC} reverse proxy:"
@@ -386,10 +800,29 @@ logs_dokploy() {
 # Open in Browser
 # ------------------------------------------------------------------------------
 open_dashboard() {
-  local url="http://localhost:${DOKPLOY_PORT}"
+  local url="http://127.0.0.1:${DOKPLOY_PORT}"
   echo -e "${BOLD}[${CMD_NAME}]${NC} Opening Dokploy dashboard: ${CYAN}${url}${NC}"
 
-  if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  # 1. macOS native browser launcher
+  if [ "$OS_TYPE" = "macos" ] || ( [ "$(uname -s 2>/dev/null)" = "Darwin" ] && command -v open >/dev/null 2>&1 ); then
+    open "$url" >/dev/null 2>&1 &
+    return 0
+  fi
+
+  # 2. Windows host browser launch support (Git Bash, MSYS2, WSL, CMD, PowerShell)
+  if command -v explorer.exe >/dev/null 2>&1; then
+    explorer.exe "$url" >/dev/null 2>&1 &
+    return 0
+  elif command -v cmd.exe >/dev/null 2>&1; then
+    cmd.exe /c start "" "$url" >/dev/null 2>&1 &
+    return 0
+  elif command -v wslview >/dev/null 2>&1; then
+    wslview "$url" >/dev/null 2>&1 &
+    return 0
+  fi
+
+  # 3. Linux desktop browser launcher (X11 / Wayland)
+  if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ] || command -v xdg-open >/dev/null 2>&1; then
     if command -v xdg-open >/dev/null 2>&1; then
       xdg-open "$url" >/dev/null 2>&1 &
       return 0
@@ -442,43 +875,189 @@ clean_dokploy() {
 }
 
 # ------------------------------------------------------------------------------
+# Reset Dokploy (Complete Clean State)
+# ------------------------------------------------------------------------------
+reset_dokploy() {
+  check_docker
+  local force=false
+  local hard=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f|--force|-y|--yes)
+        force=true
+        ;;
+      --hard)
+        hard=true
+        ;;
+      -h|--help)
+        cat << EOF
+Usage: ${CMD_NAME} reset [options]
+
+Completely wipe Dokploy data, database, config, and containers for a clean restart.
+
+Options:
+  -f, --force, -y    Skip confirmation prompt
+  --hard             Also remove all deployed user applications and networks
+  -h, --help         Show this help message
+EOF
+        return 0
+        ;;
+    esac
+    shift
+  done
+
+  if [ "$force" = false ]; then
+    echo -e "${YELLOW}${BOLD}⚠️  WARNING: Dokploy Complete Reset${NC}"
+    echo -e "This will permanently destroy:"
+    echo -e "  ${RED}•${NC} Dokploy management dashboard container & settings"
+    echo -e "  ${RED}•${NC} Dokploy PostgreSQL database & all admin credentials"
+    echo -e "  ${RED}•${NC} Traefik proxy and routing certificates"
+    echo -e "  ${RED}•${NC} Persistent volumes: ${BOLD}dokploy-postgres-data${NC}, ${BOLD}dokploy-data${NC}"
+    if [ "$hard" = true ]; then
+      echo -e "  ${RED}•${NC} All user-deployed applications on '${DOKPLOY_NETWORK}'"
+    fi
+    echo ""
+    read -r -p "Are you sure you want to completely reset Dokploy? [y/N]: " confirm
+    case "$confirm" in
+      [yY][eE][sS]|[yY]) ;;
+      *)
+        echo "Reset aborted."
+        return 0
+        ;;
+    esac
+  fi
+
+  echo -e "\n${BOLD}[${CMD_NAME}]${NC} Performing complete Dokploy reset..."
+
+  if is_swarm_available; then
+    # 1. Swarm mode cleanup
+    echo -e "  ${YELLOW}->${NC} Removing Dokploy Swarm services..."
+    $DOCKER_BIN service rm dokploy dokploy-postgres 2>/dev/null || true
+
+    if [ "$hard" = true ]; then
+      local net_id
+      net_id=$(get_dokploy_net_id)
+      if [ -n "$net_id" ]; then
+        for s_id in $($DOCKER_BIN service ls -q 2>/dev/null); do
+          $DOCKER_BIN service rm "$s_id" 2>/dev/null || true
+        done
+      fi
+    fi
+
+    echo -e "  ${YELLOW}->${NC} Stopping and removing Traefik proxy..."
+    $DOCKER_BIN rm -f dokploy-traefik 2>/dev/null || true
+
+    echo -e "  ${YELLOW}->${NC} Removing Docker Secrets..."
+    $DOCKER_BIN secret rm dokploy_postgres_password dokploy_auth_secret 2>/dev/null || true
+
+    echo -e "  ${YELLOW}->${NC} Removing network '${DOKPLOY_NETWORK}'..."
+    $DOCKER_BIN network rm "$DOKPLOY_NETWORK" 2>/dev/null || true
+
+    echo -e "  ${YELLOW}->${NC} Removing persistent volumes..."
+    $DOCKER_BIN volume rm -f dokploy-postgres-data dokploy-data dokploy-postgres dokploy 2>/dev/null || true
+  else
+    # 2. Standalone Container Mode (Kiri / single-node Docker)
+    echo -e "  ${YELLOW}->${NC} Stopping and removing core Dokploy containers..."
+    $DOCKER_BIN rm -f dokploy dokploy-postgres dokploy-traefik 2>/dev/null || true
+
+    if [ "$hard" = true ]; then
+      echo -e "  ${YELLOW}->${NC} Removing all user containers on ${DOKPLOY_NETWORK}..."
+      $DOCKER_BIN ps -a --filter "network=$DOKPLOY_NETWORK" -q 2>/dev/null | while IFS= read -r c_id; do
+        [ -n "$c_id" ] && $DOCKER_BIN rm -f "$c_id" 2>/dev/null || true
+      done
+    fi
+
+    echo -e "  ${YELLOW}->${NC} Removing network '${DOKPLOY_NETWORK}'..."
+    $DOCKER_BIN network rm "$DOKPLOY_NETWORK" 2>/dev/null || true
+
+    echo -e "  ${YELLOW}->${NC} Removing persistent volumes (database & config)..."
+    $DOCKER_BIN volume rm -f dokploy-postgres-data dokploy-data dokploy-postgres dokploy 2>/dev/null || true
+  fi
+
+  # 3. Clean local state files
+  if [ -d "$STATE_DIR" ]; then
+    echo -e "  ${YELLOW}->${NC} Cleaning CLI state cache..."
+    rm -f "$SVC_STATE" "$CONT_STATE" 2>/dev/null || true
+  fi
+
+  echo -e "\n${GREEN}✔ Dokploy has been completely reset to a clean state!${NC}"
+  echo -e "To set up a fresh Dokploy instance anytime, run:"
+  echo -e "  ${CYAN}${BOLD}${CMD_NAME} start${NC}"
+}
+
+# ------------------------------------------------------------------------------
 # Install Dokploy & Autostart Management
 # ------------------------------------------------------------------------------
 install_dokploy() {
   check_docker
 
-  echo -e "${BOLD}[${CMD_NAME}]${NC} Installing Dokploy for local development..."
-
-  # 1. Initialize Docker Swarm if not active
-  local swarm_state
-  swarm_state=$($DOCKER_BIN info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || echo "inactive")
-  if [ "$swarm_state" != "active" ]; then
-    echo -e "  ${CYAN}->${NC} Initializing Docker Swarm..."
-    $DOCKER_BIN swarm init >/dev/null 2>&1 || true
+  if ! is_swarm_available; then
+    install_dokploy_standalone
+    return 0
   fi
 
-  # 2. Check for root or sudo permissions (Dokploy requires root)
-  local SUDO_CMD=""
-  if [ "$(id -u)" -ne 0 ]; then
-    if command -v sudo >/dev/null 2>&1; then
-      echo -e "  ${YELLOW}!${NC} The official Dokploy installer requires root privileges."
-      echo -e "  ${YELLOW}!${NC} Prompting for sudo password..."
-      SUDO_CMD="sudo"
-    else
-      echo -e "${RED}Error:${NC} Dokploy installation requires root permissions. Please run as root or install sudo." >&2
-      exit 1
-    fi
+  echo -e "${BOLD}[${CMD_NAME}]${NC} Installing Dokploy for local development (Swarm on ${OS_NAME})..."
+  echo -e "  ${CYAN}->${NC} Deploying Dokploy Swarm services..."
+
+  # Create overlay network
+  $DOCKER_BIN network create --driver overlay --attachable dokploy-network 2>/dev/null || true
+
+  # Generate secrets if not existing using cross-platform generator
+  local pg_pass
+  pg_pass="$(generate_random_secret 24)"
+  echo "$pg_pass" | $DOCKER_BIN secret create dokploy_postgres_password - 2>/dev/null || true
+
+  local auth_sec
+  auth_sec="$(generate_random_secret 64)"
+  echo "$auth_sec" | $DOCKER_BIN secret create dokploy_auth_secret - 2>/dev/null || true
+
+  # Create postgres service
+  if ! $DOCKER_BIN service inspect dokploy-postgres >/dev/null 2>&1; then
+    echo -e "  ${CYAN}->${NC} Creating dokploy-postgres database service..."
+    $DOCKER_BIN service create \
+      --name dokploy-postgres \
+      --constraint 'node.role==manager' \
+      --network dokploy-network \
+      --env POSTGRES_USER=dokploy \
+      --env POSTGRES_DB=dokploy \
+      --secret source=dokploy_postgres_password,target=/run/secrets/postgres_password \
+      --env POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
+      --mount type=volume,source=dokploy-postgres,target=/var/lib/postgresql/data \
+      postgres:16 >/dev/null 2>&1 || true
   fi
 
-  # 3. Run official Dokploy installer
-  echo -e "  ${CYAN}->${NC} Fetching and executing official Dokploy installer..."
-  if command -v curl >/dev/null 2>&1; then
-    curl -sSL https://dokploy.com/install.sh | $SUDO_CMD bash
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO- https://dokploy.com/install.sh | $SUDO_CMD bash
-  else
-    echo -e "${RED}Error:${NC} Neither 'curl' nor 'wget' was found. Please install one first." >&2
-    exit 1
+  # Create dokploy service
+  if ! $DOCKER_BIN service inspect dokploy >/dev/null 2>&1; then
+    echo -e "  ${CYAN}->${NC} Creating dokploy web dashboard service..."
+    $DOCKER_BIN service create \
+      --name dokploy \
+      --replicas 1 \
+      --network dokploy-network \
+      --mount type=bind,source="${ENGINE_SOCK}",target=/var/run/docker.sock \
+      --mount type=volume,source=dokploy,target=/root/.docker \
+      --secret source=dokploy_postgres_password,target=/run/secrets/postgres_password \
+      --secret source=dokploy_auth_secret,target=/run/secrets/dokploy_auth_secret \
+      --publish published=3000,target=3000,mode=host \
+      --update-parallelism 1 \
+      --update-order stop-first \
+      --constraint 'node.role == manager' \
+      -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
+      -e BETTER_AUTH_SECRET_FILE=/run/secrets/dokploy_auth_secret \
+      dokploy/dokploy:latest >/dev/null 2>&1 || true
+  fi
+
+  # Create traefik container
+  if ! $DOCKER_BIN inspect dokploy-traefik >/dev/null 2>&1; then
+    echo -e "  ${CYAN}->${NC} Starting dokploy-traefik proxy..."
+    $DOCKER_BIN run -d \
+      --name dokploy-traefik \
+      --restart no \
+      -p 80:80 \
+      -p 443:443 \
+      -v "${ENGINE_SOCK}:/var/run/docker.sock:ro" \
+      --network dokploy-network \
+      traefik:v3.1 >/dev/null 2>&1 || true
   fi
 
   # 3. Allow Dokploy services a moment to settle before reconfiguring
@@ -506,24 +1085,27 @@ disable_autostart_dokploy() {
     echo -e "${BOLD}[${CMD_NAME}]${NC} Removing auto-startup for Dokploy and Traefik..."
   fi
 
-  # 1. Disable restart on Traefik container
-  if $DOCKER_BIN inspect dokploy-traefik >/dev/null 2>&1; then
-    [ "$quiet" = false ] && echo -e "  ${YELLOW}->${NC} Disabling restart on dokploy-traefik (--restart=no)..."
-    $DOCKER_BIN update --restart=no dokploy-traefik >/dev/null 2>&1 || true
-    $DOCKER_BIN stop dokploy-traefik >/dev/null 2>&1 || true
-  fi
+  # 1. Disable restart on standalone containers (Kiri / standard docker)
+  for c in dokploy-traefik dokploy dokploy-postgres; do
+    if $DOCKER_BIN inspect "$c" >/dev/null 2>&1; then
+      [ "$quiet" = false ] && echo -e "  ${YELLOW}->${NC} Disabling restart on $c (--restart=no)..."
+      $DOCKER_BIN update --restart=no "$c" >/dev/null 2>&1 || true
+    fi
+  done
 
-  # 2. Disable restart condition on Swarm services and scale down
-  if $DOCKER_BIN service inspect dokploy >/dev/null 2>&1; then
-    [ "$quiet" = false ] && echo -e "  ${YELLOW}->${NC} Disabling restart-condition on dokploy service..."
-    $DOCKER_BIN service update --restart-condition none dokploy >/dev/null 2>&1 || true
-    $DOCKER_BIN service scale dokploy=0 >/dev/null 2>&1 || true
-  fi
+  # 2. Disable restart condition on Swarm services if Swarm is used
+  if is_swarm_available; then
+    if $DOCKER_BIN service inspect dokploy >/dev/null 2>&1; then
+      [ "$quiet" = false ] && echo -e "  ${YELLOW}->${NC} Disabling restart-condition on dokploy service..."
+      $DOCKER_BIN service update --restart-condition none dokploy >/dev/null 2>&1 || true
+      $DOCKER_BIN service scale dokploy=0 >/dev/null 2>&1 || true
+    fi
 
-  if $DOCKER_BIN service inspect dokploy-postgres >/dev/null 2>&1; then
-    [ "$quiet" = false ] && echo -e "  ${YELLOW}->${NC} Disabling restart-condition on dokploy-postgres service..."
-    $DOCKER_BIN service update --restart-condition none dokploy-postgres >/dev/null 2>&1 || true
-    $DOCKER_BIN service scale dokploy-postgres=0 >/dev/null 2>&1 || true
+    if $DOCKER_BIN service inspect dokploy-postgres >/dev/null 2>&1; then
+      [ "$quiet" = false ] && echo -e "  ${YELLOW}->${NC} Disabling restart-condition on dokploy-postgres service..."
+      $DOCKER_BIN service update --restart-condition none dokploy-postgres >/dev/null 2>&1 || true
+      $DOCKER_BIN service scale dokploy-postgres=0 >/dev/null 2>&1 || true
+    fi
   fi
 
   if [ "$quiet" = false ]; then
@@ -622,12 +1204,16 @@ uninstall_cli() {
       echo -e "  Removing: $bin_dir/$name"
       rm -f "$bin_dir/$name"
     fi
+    if [ -f "$bin_dir/$name.cmd" ]; then
+      echo -e "  Removing: $bin_dir/$name.cmd"
+      rm -f "$bin_dir/$name.cmd"
+    fi
   done
 
-  # Remove completions from shell configuration files
-  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  # Remove completions from shell configuration files across Linux and macOS
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.zprofile"; do
     if [ -f "$rc" ]; then
-      sed -i '/# >>> dokploy-cli autocompletion >>>/,/# <<< dokploy-cli autocompletion <<</d' "$rc" 2>/dev/null || true
+      sed_inplace '/# >>> dokploy-cli autocompletion >>>/,/# <<< dokploy-cli autocompletion <<</d' "$rc"
     fi
   done
 
@@ -656,22 +1242,17 @@ update_cli() {
 
   local remote_url="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH:-main}/dok"
   local temp_file
-  temp_file=$(mktemp /tmp/dok_update.XXXXXX 2>/dev/null || echo "/tmp/dok_update_temp")
+  temp_file=$(mktemp -t dok_update.XXXXXX 2>/dev/null || mktemp /tmp/dok_update.XXXXXX 2>/dev/null || echo "/tmp/dok_update_temp")
 
+  local dl_ok=false
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$remote_url" -o "$temp_file" 2>/dev/null || {
-      echo -e "${RED}Error:${NC} Failed to fetch update from GitHub. Please check your internet connection." >&2
-      rm -f "$temp_file"
-      return 1
-    }
+    (unset MSYS_NO_PATHCONV; curl -fsSL "$remote_url" -o "$temp_file" 2>/dev/null) && dl_ok=true
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$temp_file" "$remote_url" 2>/dev/null || {
-      echo -e "${RED}Error:${NC} Failed to fetch update from GitHub. Please check your internet connection." >&2
-      rm -f "$temp_file"
-      return 1
-    }
-  else
-    echo -e "${RED}Error:${NC} Neither 'curl' nor 'wget' is available." >&2
+    (unset MSYS_NO_PATHCONV; wget -qO "$temp_file" "$remote_url" 2>/dev/null) && dl_ok=true
+  fi
+
+  if [ "$dl_ok" = false ]; then
+    echo -e "${RED}Error:${NC} Failed to fetch update from GitHub. Please check your internet connection." >&2
     rm -f "$temp_file"
     return 1
   fi
@@ -697,7 +1278,7 @@ update_cli() {
   echo -e "  Found update: ${CYAN}v${VERSION}${NC} -> ${GREEN}${BOLD}v${remote_version}${NC}"
 
   local current_bin
-  current_bin="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+  current_bin="$(resolve_script_path "$0")"
   local bin_dir
   bin_dir="$(cd "$(dirname "$current_bin")" && pwd)"
 
@@ -711,14 +1292,31 @@ update_cli() {
     sudo mv -f "$temp_file" "$current_bin"
   fi
 
-  # Ensure symlinks exist
+  # Ensure symlinks and Windows wrappers exist
+  local cur_name
+  cur_name="$(basename "$current_bin")"
   for alias_name in dok dk dokploy; do
-    if [ "$bin_dir/$alias_name" != "$current_bin" ]; then
+    if [ "$alias_name" != "$cur_name" ]; then
       if [ -w "$bin_dir" ]; then
-        ln -sf "$current_bin" "$bin_dir/$alias_name" 2>/dev/null || true
+        rm -f "$bin_dir/$alias_name" 2>/dev/null || true
+        ln -sf "$current_bin" "$bin_dir/$alias_name" 2>/dev/null || cp -f "$current_bin" "$bin_dir/$alias_name"
       else
-        sudo ln -sf "$current_bin" "$bin_dir/$alias_name" 2>/dev/null || true
+        sudo rm -f "$bin_dir/$alias_name" 2>/dev/null || true
+        sudo ln -sf "$current_bin" "$bin_dir/$alias_name" 2>/dev/null || sudo cp -f "$current_bin" "$bin_dir/$alias_name"
       fi
+    fi
+    # If on Windows, ensure Command Prompt and PowerShell wrapper exists
+    if [ "$OS_TYPE" = "windows" ] || command -v explorer.exe >/dev/null 2>&1; then
+      cat << EOFCMD > "$bin_dir/$alias_name.cmd"
+@echo off
+setlocal
+set "SCRIPT_DIR=%~dp0"
+if exist "%ProgramFiles%\\Git\\bin\\bash.exe" (
+    "%ProgramFiles%\\Git\\bin\\bash.exe" "%SCRIPT_DIR%$alias_name" %*
+) else (
+    bash "%SCRIPT_DIR%$alias_name" %*
+)
+EOFCMD
     fi
   done
 
@@ -751,7 +1349,20 @@ manage_alias() {
         exit 1
       fi
 
-      ln -sf "$target_file" "$bin_dir/$new_alias"
+      ln -sf "$target_file" "$bin_dir/$new_alias" 2>/dev/null || cp -f "$target_file" "$bin_dir/$new_alias"
+      # If on Windows, also create the Command Prompt and PowerShell wrapper
+      if command -v explorer.exe >/dev/null 2>&1 || [ -f "$bin_dir/dok.cmd" ]; then
+        cat << EOFCMD > "$bin_dir/$new_alias.cmd"
+@echo off
+setlocal
+set "SCRIPT_DIR=%~dp0"
+if exist "%ProgramFiles%\\Git\\bin\\bash.exe" (
+    "%ProgramFiles%\\Git\\bin\\bash.exe" "%SCRIPT_DIR%$new_alias" %*
+) else (
+    bash "%SCRIPT_DIR%$new_alias" %*
+)
+EOFCMD
+      fi
       echo -e "${GREEN}✔${NC} Successfully added alias: ${BOLD}${CYAN}$new_alias${NC}"
       echo -e "You can now run commands as:"
       echo -e "  ${CYAN}$new_alias start${NC}"
@@ -792,6 +1403,83 @@ manage_alias() {
 }
 
 # ------------------------------------------------------------------------------
+# Container Engine Management (Docker, Podman, Kiri)
+# ------------------------------------------------------------------------------
+manage_engine() {
+  check_docker
+  local action="${1:-status}"
+  local new_engine="${2:-}"
+
+  case "$action" in
+    status|"")
+      echo -e "${BOLD}======================================================${NC}"
+      echo -e "${BOLD} Container Engine Status (${CYAN}${CMD_NAME}${NC}${BOLD})${NC}"
+      echo -e "${BOLD}======================================================${NC}"
+      echo -e "  Active Engine:      ${GREEN}${BOLD}${ENGINE_NAME}${NC}"
+      echo -e "  CLI Executable:     ${CYAN}${ENGINE_BIN}${NC}"
+      echo -e "  Engine Type:        ${CYAN}${ENGINE_TYPE}${NC}"
+      echo -e "  Socket Path:        ${DIM}${ENGINE_SOCK}${NC}"
+      local version_str
+      version_str=$($ENGINE_BIN version --format '{{.Server.Version}}' 2>/dev/null || $ENGINE_BIN --version 2>/dev/null || echo "Unknown")
+      echo -e "  Engine Version:     ${version_str}"
+      echo ""
+      echo -e "${BOLD}Detected Container Engines:${NC}"
+      if command -v docker >/dev/null 2>&1; then
+        local d_ctx
+        d_ctx=$(docker context show 2>/dev/null || echo "default")
+        echo -e "  ${GREEN}✔${NC} ${BOLD}docker${NC}  (Context: ${CYAN}${d_ctx}${NC})"
+      else
+        echo -e "  ${DIM}○ docker  (Not installed)${NC}"
+      fi
+      if command -v podman >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✔${NC} ${BOLD}podman${NC}  (Ready)"
+      else
+        echo -e "  ${DIM}○ podman  (Not installed)${NC}"
+      fi
+      if command -v kiri >/dev/null 2>&1 || (command -v docker >/dev/null 2>&1 && docker context ls 2>/dev/null | grep -qi "kiri"); then
+        echo -e "  ${GREEN}✔${NC} ${BOLD}kiri${NC}    (Ready)"
+      else
+        echo -e "  ${DIM}○ kiri    (Not detected)${NC}"
+      fi
+      if command -v nerdctl >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✔${NC} ${BOLD}nerdctl${NC} (Ready)"
+      else
+        echo -e "  ${DIM}○ nerdctl (Not installed)${NC}"
+      fi
+      echo ""
+      echo -e "${DIM}Switch engine anytime:${NC} ${CMD_NAME} engine set <docker|podman|kiri|nerdctl|auto>"
+      ;;
+    set)
+      if [ -z "$new_engine" ]; then
+        echo -e "${RED}Error:${NC} Please specify an engine: ${CMD_NAME} engine set <docker|podman|kiri|auto>"
+        return 1
+      fi
+      mkdir -p "$CONFIG_DIR"
+      if [ -f "$CONFIG_FILE" ] && grep -q "^CONTAINER_ENGINE=" "$CONFIG_FILE" 2>/dev/null; then
+        sed_inplace "s/^CONTAINER_ENGINE=.*/CONTAINER_ENGINE=\"$new_engine\"/" "$CONFIG_FILE"
+      else
+        echo "CONTAINER_ENGINE=\"$new_engine\"" >> "$CONFIG_FILE"
+      fi
+      echo -e "${GREEN}✔${NC} Default container engine set to: ${BOLD}${CYAN}${new_engine}${NC} in $CONFIG_FILE"
+      echo -e "Run ${CYAN}${CMD_NAME} engine status${NC} to verify."
+      ;;
+    list)
+      echo -e "${BOLD}Available Container Engines on System:${NC}"
+      for eng in docker podman kiri nerdctl; do
+        if command -v "$eng" >/dev/null 2>&1 || [ "$eng" = "kiri" -a -n "$(docker context ls 2>/dev/null | grep -i kiri)" ]; then
+          echo -e "  ${GREEN}●${NC} ${BOLD}$eng${NC} [Available]"
+        else
+          echo -e "  ${DIM}○ $eng [Not installed]${NC}"
+        fi
+      done
+      ;;
+    *)
+      echo "Usage: ${CMD_NAME} engine [status|list|set <docker|podman|kiri|nerdctl|auto>]"
+      ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
 # Shell Completion Generators
 # ------------------------------------------------------------------------------
 generate_bash_completion() {
@@ -804,7 +1492,7 @@ _dokploy_completion() {
     cword=$COMP_CWORD
   fi
 
-  local commands="start up stop down restart status ps logs log open ui clean prune alias autostart disable-autostart install-dokploy update upgrade uninstall completion version help -h --help -v --version"
+  local commands="start up stop down restart status ps logs log open ui clean prune reset alias engine autostart disable-autostart install-dokploy update upgrade uninstall completion version help -h --help -v --version"
 
   if [ "$cword" -eq 1 ]; then
     COMPREPLY=( $(compgen -W "$commands" -- "$cur") )
@@ -826,8 +1514,14 @@ _dokploy_completion() {
     clean|prune)
       COMPREPLY=( $(compgen -W "--force -f --all -a" -- "$cur") )
       ;;
+    reset)
+      COMPREPLY=( $(compgen -W "--force -f -y --yes --hard" -- "$cur") )
+      ;;
     alias)
       COMPREPLY=( $(compgen -W "add set list" -- "$cur") )
+      ;;
+    engine)
+      COMPREPLY=( $(compgen -W "status list set" -- "$cur") )
       ;;
     autostart)
       COMPREPLY=( $(compgen -W "status disable enable" -- "$cur") )
@@ -863,7 +1557,9 @@ _dokploy_zsh() {
     'logs:View Dokploy or service logs'
     'open:Open Dokploy dashboard in browser'
     'clean:Prune unused Docker containers and build cache'
+    'reset:Completely wipe Dokploy data, database, and containers'
     'alias:Manage command aliases (e.g. dok, dk)'
+    'engine:Inspect or switch container engine (docker, podman, kiri)'
     'install-dokploy:Install Dokploy and disable boot auto-startup'
     'disable-autostart:Disable Dokploy & Traefik auto-startup on boot'
     'autostart:Manage boot auto-startup (status, disable, enable)'
@@ -926,7 +1622,11 @@ EOF
 show_version() {
   echo -e "${BOLD}Dokploy Local CLI:${NC} v${VERSION}"
   echo -e "Command alias:      ${CYAN}${CMD_NAME}${NC}"
+  echo -e "Platform:           ${GREEN}${OS_NAME}${NC}"
   check_docker 2>/dev/null || true
+  if [ -n "$ENGINE_NAME" ]; then
+    echo -e "Container Engine:   ${GREEN}${ENGINE_NAME}${NC}"
+  fi
   if [ -n "$DOCKER_BIN" ]; then
     local dok_img
     dok_img=$(get_dokploy_image)
@@ -963,9 +1663,17 @@ case "${1:-}" in
     shift
     clean_dokploy "$@"
     ;;
+  reset)
+    shift
+    reset_dokploy "$@"
+    ;;
   alias)
     shift
     manage_alias "$@"
+    ;;
+  engine)
+    shift
+    manage_engine "$@"
     ;;
   install-dokploy|setup-dokploy)
     install_dokploy

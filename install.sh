@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Dokploy Local CLI Installer (for all Linux distributions)
+# Dokploy Local CLI Installer
+# Supports Windows, macOS, and Linux
 # ==============================================================================
-#
+# Prevent Git Bash / MSYS on Windows from auto-converting Unix paths
+export MSYS_NO_PATHCONV=1
+
 # CONFIGURATION VARIABLE: Primary Command Word
 # Change this variable to customize the default command word:
 #   "dok"     -> 'dok start', 'dok stop'
@@ -38,6 +41,56 @@ else
   NC=""
 fi
 
+# ------------------------------------------------------------------------------
+# OS Platform Detection (Linux, macOS, Windows)
+# ------------------------------------------------------------------------------
+OS_TYPE=""
+OS_NAME=""
+detect_os() {
+  if [ -n "$OS_TYPE" ]; then
+    return 0
+  fi
+  case "$(uname -s 2>/dev/null || echo "")" in
+    Darwin*)
+      OS_TYPE="macos"
+      OS_NAME="macOS"
+      ;;
+    Linux*)
+      if grep -qi "microsoft" /proc/version 2>/dev/null || [ -n "${WSL_DISTRO_NAME:-}" ]; then
+        OS_TYPE="wsl"
+        OS_NAME="Linux (WSL)"
+      else
+        OS_TYPE="linux"
+        OS_NAME="Linux"
+      fi
+      ;;
+    MINGW*|MSYS*|CYGWIN*)
+      OS_TYPE="windows"
+      OS_NAME="Windows"
+      ;;
+    *)
+      if command -v cmd.exe >/dev/null 2>&1 || command -v powershell.exe >/dev/null 2>&1; then
+        OS_TYPE="windows"
+        OS_NAME="Windows"
+      else
+        OS_TYPE="unix"
+        OS_NAME="$(uname -s 2>/dev/null || echo 'Unix')"
+      fi
+      ;;
+  esac
+}
+detect_os
+
+# Cross-platform in-place sed (compatible with macOS BSD sed and Linux GNU sed)
+sed_inplace() {
+  local expr="$1"
+  local file="$2"
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  sed -i.dokbak "$expr" "$file" 2>/dev/null && rm -f "${file}.dokbak" 2>/dev/null || true
+}
+
 SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || pwd)"
 SOURCE_BIN="$SRC_DIR/dok"
 
@@ -47,7 +100,9 @@ GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
 GITHUB_RAW_URL="${GITHUB_RAW_BASE:-https://raw.githubusercontent.com/$GITHUB_REPO/$GITHUB_BRANCH}"
 
 # Target installation directory
-if [ "$(id -u)" -eq 0 ]; then
+if [ "$(id -u 2>/dev/null || echo 1000)" -eq 0 ]; then
+  INSTALL_DIR="/usr/local/bin"
+elif [ "$OS_TYPE" = "macos" ] && [ -w "/usr/local/bin" ]; then
   INSTALL_DIR="/usr/local/bin"
 else
   INSTALL_DIR="$HOME/.local/bin"
@@ -71,12 +126,16 @@ uninstall() {
       echo -e "  Removing: $INSTALL_DIR/$name"
       rm -f "$INSTALL_DIR/$name"
     fi
+    if [ -f "$INSTALL_DIR/$name.cmd" ]; then
+      echo -e "  Removing: $INSTALL_DIR/$name.cmd"
+      rm -f "$INSTALL_DIR/$name.cmd"
+    fi
   done
 
-  # Remove completions from shell configuration files
-  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  # Remove completions from shell configuration files across Linux and macOS
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.zprofile"; do
     if [ -f "$rc" ]; then
-      sed -i '/# >>> dokploy-cli autocompletion >>>/,/# <<< dokploy-cli autocompletion <<</d' "$rc" 2>/dev/null || true
+      sed_inplace '/# >>> dokploy-cli autocompletion >>>/,/# <<< dokploy-cli autocompletion <<</d' "$rc"
     fi
   done
 
@@ -196,10 +255,32 @@ for alias_name in "${DEFAULT_ALIASES[@]}"; do
   if [ "$alias_name" != "$CLI_NAME" ]; then
     # Remove previous alias or file to cleanly link
     rm -f "$INSTALL_DIR/$alias_name"
-    ln -sf "$INSTALL_DIR/$CLI_NAME" "$INSTALL_DIR/$alias_name"
+    ln -sf "$INSTALL_DIR/$CLI_NAME" "$INSTALL_DIR/$alias_name" 2>/dev/null || cp -f "$INSTALL_DIR/$CLI_NAME" "$INSTALL_DIR/$alias_name"
     echo -e "    ${GREEN}->${NC} Alias '${CYAN}$alias_name${NC}' linked to '$CLI_NAME'"
   fi
 done
+
+# If running on Windows / MinGW / MSYS / Git Bash, create .cmd wrappers for Command Prompt and PowerShell
+IS_WINDOWS=false
+case "$(uname -s 2>/dev/null || echo "")" in
+  MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=true ;;
+esac
+if [ "$IS_WINDOWS" = true ] || command -v explorer.exe >/dev/null 2>&1; then
+  echo -e "  Configuring Windows Command Prompt and PowerShell wrappers..."
+  for cmd_target in "${DEFAULT_ALIASES[@]}" "$CLI_NAME"; do
+    cat << EOFCMD > "$INSTALL_DIR/$cmd_target.cmd"
+@echo off
+setlocal
+set "SCRIPT_DIR=%~dp0"
+if exist "%ProgramFiles%\\Git\\bin\\bash.exe" (
+    "%ProgramFiles%\\Git\\bin\\bash.exe" "%SCRIPT_DIR%$cmd_target" %*
+) else (
+    bash "%SCRIPT_DIR%$cmd_target" %*
+)
+EOFCMD
+    echo -e "    ${GREEN}->${NC} Windows wrapper created: ${CYAN}$INSTALL_DIR/$cmd_target.cmd${NC}"
+  done
+fi
 
 # Save configuration
 mkdir -p "$CONFIG_DIR"
@@ -235,6 +316,8 @@ case ":$PATH:" in
     echo -e "  ${YELLOW}!${NC} $INSTALL_DIR is not currently in your PATH."
     add_to_path_if_needed "$HOME/.bashrc"
     add_to_path_if_needed "$HOME/.zshrc"
+    add_to_path_if_needed "$HOME/.zprofile"
+    add_to_path_if_needed "$HOME/.bash_profile"
     add_to_path_if_needed "$HOME/.profile"
     ;;
 esac
@@ -247,8 +330,8 @@ setup_completion() {
   local shell_type="$2"
 
   if [ -f "$shell_rc" ]; then
-    # Clean previous block if present
-    sed -i '/# >>> dokploy-cli autocompletion >>>/,/# <<< dokploy-cli autocompletion <<</d' "$shell_rc" 2>/dev/null || true
+    # Clean previous block if present using portable sed
+    sed_inplace '/# >>> dokploy-cli autocompletion >>>/,/# <<< dokploy-cli autocompletion <<</d' "$shell_rc"
 
     echo -e "  Configuring tab completion in: ${CYAN}$shell_rc${NC}"
     cat << EOF >> "$shell_rc"
@@ -268,19 +351,28 @@ EOF
 
 setup_completion "$HOME/.bashrc" "bash"
 setup_completion "$HOME/.zshrc" "zsh"
+[ -f "$HOME/.bash_profile" ] && setup_completion "$HOME/.bash_profile" "bash"
+[ -f "$HOME/.zprofile" ] && setup_completion "$HOME/.zprofile" "zsh"
 
 # If root, install system-wide completion
-if [ "$(id -u)" -eq 0 ]; then
+if [ "$(id -u 2>/dev/null || echo 1000)" -eq 0 ]; then
   if [ -d "/etc/bash_completion.d" ]; then
     "$INSTALL_DIR/$CLI_NAME" completion bash > /etc/bash_completion.d/dokploy
     echo -e "  Installed system-wide bash completion to /etc/bash_completion.d/dokploy"
   fi
 fi
 
+# Homebrew bash-completion on macOS
+for brew_comp in "/opt/homebrew/etc/bash_completion.d" "/usr/local/etc/bash_completion.d"; do
+  if [ -d "$brew_comp" ] && [ -w "$brew_comp" ]; then
+    "$INSTALL_DIR/$CLI_NAME" completion bash > "$brew_comp/dokploy" 2>/dev/null || true
+  fi
+done
+
 # ------------------------------------------------------------------------------
 # Finish & Quick Start
 # ------------------------------------------------------------------------------
-echo -e "\n${GREEN}✔ Installation successful!${NC}\n"
+echo -e "\n${GREEN}✔ Installation successful on ${OS_NAME}!${NC}\n"
 echo -e "You can now run commands using either ${BOLD}${CYAN}${CLI_NAME}${NC} or any alias:"
 echo -e "  ${CYAN}${CLI_NAME} start${NC}         # Start Dokploy core + Traefik"
 echo -e "  ${CYAN}${CLI_NAME} start --core${NC}  # Start only panel & database"
