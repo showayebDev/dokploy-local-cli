@@ -1242,15 +1242,32 @@ update_cli() {
 
   echo -e "${BOLD}[${CMD_NAME}]${NC} Checking for updates from GitHub (${CYAN}${GITHUB_REPO}${NC})..."
 
-  local remote_url="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH:-main}/dok"
   local temp_file
   temp_file=$(mktemp -t dok_update.XXXXXX 2>/dev/null || mktemp /tmp/dok_update.XXXXXX 2>/dev/null || echo "/tmp/dok_update_temp")
 
+  # Strategy 1: Download from GitHub Release asset (instant, no raw CDN cache)
   local dl_ok=false
+  local release_url="https://github.com/${GITHUB_REPO}/releases/latest/download/dok"
   if command -v curl >/dev/null 2>&1; then
-    (unset MSYS_NO_PATHCONV; curl -fsSL "$remote_url" -o "$temp_file" 2>/dev/null) && dl_ok=true
+    (unset MSYS_NO_PATHCONV; curl -fsSL "$release_url" -o "$temp_file" 2>/dev/null) && dl_ok=true
   elif command -v wget >/dev/null 2>&1; then
-    (unset MSYS_NO_PATHCONV; wget -qO "$temp_file" "$remote_url" 2>/dev/null) && dl_ok=true
+    (unset MSYS_NO_PATHCONV; wget -qO "$temp_file" "$release_url" 2>/dev/null) && dl_ok=true
+  fi
+
+  # Strategy 2: If release asset not available, download from raw using commit SHA or branch
+  if [ "$dl_ok" = false ] || ! grep -q "#!/usr/bin/env bash" "$temp_file" 2>/dev/null; then
+    local commit_ref="${GITHUB_BRANCH:-main}"
+    if command -v curl >/dev/null 2>&1; then
+      local latest_sha
+      latest_sha=$(curl -fsSL --connect-timeout 4 -H "User-Agent: dokploy-cli" "https://api.github.com/repos/${GITHUB_REPO}/commits/${commit_ref}" 2>/dev/null | grep -m1 '"sha":' | cut -d'"' -f4 || true)
+      [ -n "$latest_sha" ] && commit_ref="$latest_sha"
+    fi
+    local remote_url="https://raw.githubusercontent.com/${GITHUB_REPO}/${commit_ref}/dok"
+    if command -v curl >/dev/null 2>&1; then
+      (unset MSYS_NO_PATHCONV; curl -fsSL "$remote_url" -o "$temp_file" 2>/dev/null) && dl_ok=true
+    elif command -v wget >/dev/null 2>&1; then
+      (unset MSYS_NO_PATHCONV; wget -qO "$temp_file" "$remote_url" 2>/dev/null) && dl_ok=true
+    fi
   fi
 
   if [ "$dl_ok" = false ]; then
@@ -1270,11 +1287,26 @@ update_cli() {
   remote_version=$(grep -m1 '^VERSION=' "$temp_file" | cut -d'"' -f2)
   [ -z "$remote_version" ] && remote_version="latest"
 
-  if [ "$force" = false ] && [ "$remote_version" = "$VERSION" ]; then
-    echo -e "${GREEN}✔${NC} Dokploy Local CLI is already on the latest version (${CYAN}v${VERSION}${NC})."
-    echo -e "  To force reinstall anyway, run: ${CYAN}${CMD_NAME} update --force${NC}"
-    rm -f "$temp_file"
-    return 0
+  if [ "$force" = false ]; then
+    if [ "$remote_version" = "$VERSION" ]; then
+      echo -e "${GREEN}✔${NC} Dokploy Local CLI is already on the latest version (${CYAN}v${VERSION}${NC})."
+      echo -e "  To force reinstall anyway, run: ${CYAN}${CMD_NAME} update --force${NC}"
+      rm -f "$temp_file"
+      return 0
+    fi
+
+    # Prevent accidental downgrades when remote version is older than local version
+    if [ "$remote_version" != "latest" ] && command -v sort >/dev/null 2>&1; then
+      local oldest
+      oldest=$(printf '%s\n%s\n' "$VERSION" "$remote_version" | sort -V | head -n 1)
+      if [ "$oldest" = "$remote_version" ]; then
+        echo -e "${GREEN}✔${NC} Dokploy Local CLI is already on the latest version (${CYAN}v${VERSION}${NC})."
+        echo -e "  (Remote: v${remote_version}, Local: v${VERSION})"
+        echo -e "  To force reinstall anyway, run: ${CYAN}${CMD_NAME} update --force${NC}"
+        rm -f "$temp_file"
+        return 0
+      fi
+    fi
   fi
 
   echo -e "  Found update: ${CYAN}v${VERSION}${NC} -> ${GREEN}${BOLD}v${remote_version}${NC}"
