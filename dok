@@ -21,7 +21,7 @@ DEFAULT_CLI_NAME="dok"
 
 set -e
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 GITHUB_REPO="${GITHUB_REPO:-showayebDev/dokploy-local-cli}"
 GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
 
