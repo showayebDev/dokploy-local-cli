@@ -114,10 +114,9 @@ foreach ($cmdName in $AllTargets) {
 setlocal
 set "SCRIPT_DIR=%~dp0"
 if exist "%ProgramFiles%\Git\bin\bash.exe" (
-    "%ProgramFiles%\Git\bin\bash.exe" "%SCRIPT_DIR%$cmdName" %*
-) else (
-    bash "%SCRIPT_DIR%$cmdName" %*
+    "%ProgramFiles%\Git\bin\bash.exe" "%SCRIPT_DIR%$cmdName" %* & goto :eof
 )
+bash "%SCRIPT_DIR%$cmdName" %* & goto :eof
 "@
     Set-Content -Path $cmdFile -Value $cmdContent -Encoding ASCII
     Write-Info "Wrapper created: $cmdFile"

@@ -1208,7 +1208,13 @@ uninstall_cli() {
     fi
     if [ -f "$bin_dir/$name.cmd" ]; then
       echo -e "  Removing: $bin_dir/$name.cmd"
-      rm -f "$bin_dir/$name.cmd"
+      if command -v cmd.exe >/dev/null 2>&1; then
+        local win_file
+        win_file=$(cygpath -w "$bin_dir/$name.cmd" 2>/dev/null || echo "$bin_dir/$name.cmd")
+        (cmd.exe /c "ping -n 2 127.0.0.1 >nul & del /f /q \"$win_file\"" >/dev/null 2>&1 &)
+      else
+        rm -f "$bin_dir/$name.cmd"
+      fi
     fi
   done
 
