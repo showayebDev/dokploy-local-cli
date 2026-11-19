@@ -1,21 +1,12 @@
-﻿<#
-.SYNOPSIS
-    Dokploy Local CLI Installer for Windows (PowerShell)
-.DESCRIPTION
-    Installs the Dokploy Local CLI on Windows and configures PowerShell
-    and Command Prompt (CMD) wrappers (dok.cmd, dk.cmd, dokploy.cmd).
-.EXAMPLE
-    irm https://raw.githubusercontent.com/showayebDev/dokploy-local-cli/main/install.ps1 | iex
-#>
-
-[CmdletBinding()]
-param (
-    [string]$CliName = "dok",
-    [switch]$Uninstall,
-    [switch]$InstallDokploy
-)
+﻿# Dokploy Local CLI Installer for Windows (PowerShell)
+# Run via: irm https://raw.githubusercontent.com/showayebDev/dokploy-local-cli/main/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
+
+$CliName = "dok"
+if ($args.Count -gt 0 -and $args[0] -and ($args[0] -notlike "-*")) {
+    $CliName = $args[0]
+}
 
 function Write-Success ($msg) { Write-Host "✔ $msg" -ForegroundColor Green }
 function Write-Info ($msg)    { Write-Host "  -> $msg" -ForegroundColor Cyan }
@@ -27,7 +18,8 @@ $ConfigDir  = Join-Path $HOME ".config\dokploy-cli"
 $ConfigFile = Join-Path $ConfigDir "config"
 
 # Handle Uninstall
-if ($Uninstall) {
+$DoUninstall = ($args -contains "--uninstall") -or ($args -contains "-u") -or ($env:DOK_UNINSTALL -eq "1") -or ($env:UNINSTALL -eq "1")
+if ($DoUninstall) {
     Write-Host "Uninstalling Dokploy Local CLI..." -ForegroundColor Yellow
     $Aliases = @("dok", "dk", "dokploy", $CliName) | Select-Object -Unique
     foreach ($name in $Aliases) {
@@ -41,7 +33,9 @@ if ($Uninstall) {
         Write-Info "Removed $ConfigDir"
     }
     Write-Success "Dokploy Local CLI has been completely uninstalled."
-    exit 0
+    Remove-Item env:DOK_UNINSTALL -ErrorAction SilentlyContinue
+    Remove-Item env:UNINSTALL -ErrorAction SilentlyContinue
+    return
 }
 
 Write-Host "`n=== Dokploy Local CLI Windows Installer ===" -ForegroundColor Cyan
@@ -54,10 +48,18 @@ if (-not (Test-Path $GitBashPath)) {
     if ($bashCmd) {
         $GitBashPath = $bashCmd.Source
     } else {
-        Write-Err "Git Bash is required to run the CLI on Windows."
-        Write-Host "Please install Git for Windows from: https://git-scm.com/download/win"
-        exit 1
+        $gitCmd = Get-Command "git.exe" -ErrorAction SilentlyContinue
+        if ($gitCmd) {
+            $possibleBash = Join-Path (Split-Path (Split-Path $gitCmd.Source)) "bin\bash.exe"
+            if (Test-Path $possibleBash) { $GitBashPath = $possibleBash }
+        }
     }
+}
+
+if (-not (Test-Path $GitBashPath)) {
+    Write-Err "Git Bash is required to run the CLI on Windows."
+    Write-Host "Please install Git for Windows from: https://git-scm.com/download/win"
+    return
 }
 Write-Info "Found Bash engine: $GitBashPath"
 
@@ -74,9 +76,23 @@ if ($SourceBin -and (Test-Path $SourceBin)) {
     Write-Info "Installing from local source: $SourceBin"
     Copy-Item -Path $SourceBin -Destination $TargetBin -Force
 } else {
+    $ReleaseUrl = "https://github.com/showayebDev/dokploy-local-cli/releases/latest/download/dok"
     $RawUrl = "https://raw.githubusercontent.com/showayebDev/dokploy-local-cli/main/dok"
     Write-Info "Downloading CLI script from GitHub..."
-    Invoke-WebRequest -Uri $RawUrl -OutFile $TargetBin -UseBasicParsing
+    $Downloaded = $false
+    if (Get-Command "curl.exe" -ErrorAction SilentlyContinue) {
+        & curl.exe -fsSL "$ReleaseUrl" -o "$TargetBin" 2>$null
+        if ((Test-Path $TargetBin) -and (Get-Item $TargetBin).Length -gt 1000) { $Downloaded = $true }
+    }
+    if (-not $Downloaded) {
+        try {
+            Invoke-WebRequest -Uri $ReleaseUrl -OutFile $TargetBin -UseBasicParsing -ErrorAction Stop
+            $Downloaded = $true
+        } catch {
+            Invoke-WebRequest -Uri $RawUrl -OutFile $TargetBin -UseBasicParsing -ErrorAction Stop
+            $Downloaded = $true
+        }
+    }
 }
 
 # Create convenience copies for aliases (dok, dk, dokploy)
@@ -144,6 +160,6 @@ Write-Host "  dok stop          # Stop Dokploy to free CPU & RAM" -ForegroundCol
 Write-Host "  dok reset -f      # Completely reset database & containers`n" -ForegroundColor Cyan
 Write-Host "Both 'dok' and 'dk' are available out of the box!`n" -ForegroundColor Green
 
-if ($InstallDokploy) {
+if ($args -contains "--install-dokploy" -or $env:INSTALL_DOKPLOY -eq "1") {
     & "$InstallDir\dok.cmd" install-dokploy
 }

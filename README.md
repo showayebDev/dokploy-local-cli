@@ -303,7 +303,7 @@ dk uninstall -y
 ### Method 2: One-Line Remote Uninstall
 - **Windows (PowerShell):**
   ```powershell
-  irm https://raw.githubusercontent.com/showayebDev/dokploy-local-cli/main/install.ps1 | iex -ArgumentList '--uninstall'
+  irm https://raw.githubusercontent.com/showayebDev/dokploy-local-cli/main/uninstall.ps1 | iex
   ```
 - **macOS & Linux:**
   ```bash
