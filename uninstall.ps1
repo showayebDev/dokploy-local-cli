@@ -1,4 +1,4 @@
-﻿# Dokploy Local CLI Uninstaller for Windows (PowerShell)
+# Dokploy Local CLI Uninstaller for Windows for Windows PowerShell
 # Run via: irm https://raw.githubusercontent.com/showayebDev/dokploy-local-cli/main/uninstall.ps1 | iex
 
 $ErrorActionPreference = "SilentlyContinue"
