@@ -2,6 +2,7 @@
 # Run via: irm https://raw.githubusercontent.com/showayebDev/dokploy-local-cli/main/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 
 $CliName = "dok"
 if ($args.Count -gt 0 -and $args[0]) {
@@ -75,7 +76,11 @@ if ($SourceBin -and (Test-Path $SourceBin)) {
 } else {
     $RawUrl = "https://raw.githubusercontent.com/showayebDev/dokploy-local-cli/main/dok"
     Write-Info "Downloading CLI script from GitHub..."
-    Invoke-WebRequest -Uri $RawUrl -OutFile $TargetBin -UseBasicParsing
+    if (Get-Command "curl.exe" -ErrorAction SilentlyContinue) {
+        & curl.exe -fsSL "$RawUrl" -o "$TargetBin"
+    } else {
+        (New-Object System.Net.WebClient).DownloadFile($RawUrl, $TargetBin)
+    }
 }
 
 # Create convenience copies for aliases (dok, dk, dokploy)
