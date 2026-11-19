@@ -164,6 +164,22 @@ dok start
 
 ---
 
+## 💡 Local Deployment Tips (Kiri, Podman & Docker)
+
+### 1. Choosing "Compose" vs. "Application" in Dokploy
+- Dokploy provides two ways to deploy user services: **Application** and **Compose**.
+- **Application:** Uses Docker Swarm mode (`docker service create`).
+- **Compose:** Uses standard Docker Compose (`docker compose up`).
+> [!IMPORTANT]
+> If you are using **Kiri**, **Podman**, or standalone Docker without Swarm initialized, always create your service as **Compose**. Standalone runtimes do not implement Docker Swarm's `POST /services/create` endpoint.
+
+### 2. Local Domain Routing (`*.localhost`)
+- You can route services using any domain ending in `.localhost` (e.g., `api.localhost`, `app.localhost`).
+- **Modern Web Browsers** (Chrome, Edge, Firefox, Safari) automatically resolve `*.localhost` domains locally to `127.0.0.1` without needing to modify `/etc/hosts` or system DNS.
+- **Note on Dokploy's "Validate DNS" badge:** The red warning `queryA ENOTFOUND api.localhost` inside Dokploy's dashboard is purely an informational check querying public DNS for public web domains. It does **not** affect local routing; your domain will work instantly in your browser!
+
+---
+
 ## 🛠️ Detailed Usage & Workflow
 
 ### 1. Core Mode vs. Full Mode (Resource Optimization)
