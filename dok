@@ -487,7 +487,9 @@ install_dokploy_standalone() {
       -p 80:80 \
       -p 443:443 \
       -v "${ENGINE_SOCK}:/var/run/docker.sock:ro" \
-      traefik:v3.1 || true
+      -v dokploy-data:/etc/dokploy \
+      traefik:v3.1 \
+      --configFile=/etc/dokploy/traefik/traefik.yml || true
   else
     $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1 || true
   fi
