@@ -547,6 +547,8 @@ start_dokploy() {
 
     echo -e "${BOLD}[${CMD_NAME}]${NC} Starting Dokploy core containers (${ENGINE_NAME})..."
     $DOCKER_BIN start dokploy-postgres dokploy >/dev/null 2>&1 || true
+    # Strip swarm provider from traefik.yml for standalone engines (Kiri / Podman)
+    $DOCKER_BIN exec dokploy sed -i '/swarm:/,/watch:/d' /etc/dokploy/traefik/traefik.yml 2>/dev/null || true
     if [ "$mode" != "--core" ] && [ "$mode" != "-c" ]; then
       $DOCKER_BIN start dokploy-traefik >/dev/null 2>&1 || true
     fi
